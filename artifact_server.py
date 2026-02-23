@@ -16,6 +16,9 @@ Features:
     - Serves zip files at /artifacts/<version>/<filename>
     - Lists all hosted versions on the main page
     - Configurable subpath via ARTIFACT_SUBPATH env var (e.g. /kibana-artifacts)
+    - Server-side proxy to fetch artifacts from Elastic S3 (avoids CORS issues)
+    - CORS middleware with configurable allowed origins
+    - Optional SSL/TLS for HTTPS serving and outbound SSL verification control
 
 Run directly:
     pip install fastapi uvicorn python-multipart
@@ -31,15 +34,22 @@ Subpath example:
     # Kibana config: http://<host>:8080/kibana-artifacts/artifacts/9.3
 """
 
+import logging
 import os
 import re
+import ssl
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request as URLRequest, urlopen
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, File, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+
+logger = logging.getLogger("artifact_server")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -49,9 +59,21 @@ HOST = os.environ.get("ARTIFACT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ARTIFACT_PORT", "8080"))
 MAX_CONTENT_MB = int(os.environ.get("ARTIFACT_MAX_UPLOAD_MB", "500"))
 
+# SSL / TLS
+SSL_CERTFILE = os.environ.get("ARTIFACT_SSL_CERTFILE", "") or None
+SSL_KEYFILE = os.environ.get("ARTIFACT_SSL_KEYFILE", "") or None
+# Disable SSL verification for outbound proxy requests (e.g. corporate MITM proxies)
+SSL_VERIFY = os.environ.get("ARTIFACT_SSL_VERIFY", "1").lower() not in ("0", "false", "no")
+
+# CORS — comma-separated origins, or "*" to allow all
+_cors_origins = os.environ.get("ARTIFACT_CORS_ORIGINS", "*")
+CORS_ORIGINS: list[str] = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+
 # Subpath support — strip/add leading/trailing slashes for consistency
 _raw_subpath = os.environ.get("ARTIFACT_SUBPATH", "").strip("/")
 SUBPATH = f"/{_raw_subpath}" if _raw_subpath else ""
+
+ELASTIC_BASE_URL = "https://kibana-knowledge-base-artifacts.elastic.co"
 
 PRODUCTS = ["elasticsearch", "kibana", "observability", "security"]
 FILENAME_RE = re.compile(
@@ -63,6 +85,16 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
+
+# CORS middleware — allows the UI / external clients to call the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 router = APIRouter(prefix=SUBPATH)
 
 # ---------------------------------------------------------------------------
@@ -153,6 +185,24 @@ def _base_url(request: Request) -> str:
     host = request.headers.get("x-forwarded-host", request.headers.get("host", ""))
     return f"{scheme}://{host}{SUBPATH}"
 
+
+def _ssl_context() -> ssl.SSLContext | None:
+    """Build an SSL context for outbound requests; respects ARTIFACT_SSL_VERIFY."""
+    if SSL_VERIFY:
+        return None  # use default verification
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _fetch_url(url: str, timeout: int = 60) -> bytes:
+    """Fetch a URL using urllib, honouring the SSL_VERIFY setting."""
+    ctx = _ssl_context()
+    req = URLRequest(url, headers={"User-Agent": "elastic-kb-artifact-server/1.0"})
+    with urlopen(req, timeout=timeout, context=ctx) as resp:
+        return resp.read()
+
 # ---------------------------------------------------------------------------
 # HTML Template (single-page UI)
 # ---------------------------------------------------------------------------
@@ -235,8 +285,8 @@ HTML_TEMPLATE = """
   <div class="card">
     <h2>🌐 Download from Elastic</h2>
     <p style="margin-bottom:.75rem;color:var(--muted)">
-      Fetch official knowledge base artifacts from the Elastic S3 bucket directly through your browser,
-      then automatically upload them to this server. Your browser's proxy settings are used for the download.
+      Fetch official knowledge base artifacts from the Elastic S3 bucket via the server proxy,
+      then automatically store them. Works even when your browser cannot reach the S3 bucket directly.
     </p>
     <div>
       <button id="dl-fetch-btn" class="btn btn-secondary" onclick="fetchElasticIndex()">Fetch Available Versions</button>
@@ -267,7 +317,6 @@ HTML_TEMPLATE = """
   </footer>
 </div>
 <script>
-const ELASTIC_BASE = "https://kibana-knowledge-base-artifacts.elastic.co";
 const PRODUCTS = ["elasticsearch", "kibana", "observability", "security"];
 const SUBPATH = "{subpath}";
 let allArtifacts = [];
@@ -301,34 +350,18 @@ async function fetchElasticIndex() {{
   btn.textContent = "Fetching…";
   document.getElementById("dl-progress").style.display = "block";
   document.getElementById("dl-log").innerHTML = "";
-  logMsg("Fetching artifact index from " + ELASTIC_BASE + " …", "log-info");
+  logMsg("Fetching artifact index via server proxy …", "log-info");
 
   try {{
-    const resp = await fetch(ELASTIC_BASE);
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const xmlText = await resp.text();
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(xmlText, "application/xml");
-
-    allArtifacts = [];
-    const contents = doc.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "Contents");
-    /* Fallback: try without namespace */
-    const items = contents.length > 0 ? contents : doc.getElementsByTagName("Contents");
-    for (const c of items) {{
-      const keyEl = c.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "Key")[0]
-                 || c.getElementsByTagName("Key")[0];
-      const sizeEl = c.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "Size")[0]
-                  || c.getElementsByTagName("Size")[0];
-      const modEl = c.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "LastModified")[0]
-                 || c.getElementsByTagName("LastModified")[0];
-      if (keyEl) {{
-        allArtifacts.push({{
-          key: keyEl.textContent,
-          size: parseInt(sizeEl ? sizeEl.textContent : "0", 10),
-          lastModified: modEl ? modEl.textContent : ""
-        }});
-      }}
+    const resp = await fetch(SUBPATH + "/proxy/elastic-index");
+    if (!resp.ok) {{
+      const errBody = await resp.text().catch(() => "");
+      throw new Error("HTTP " + resp.status + (errBody ? ": " + errBody : ""));
     }}
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+
+    allArtifacts = data.artifacts || [];
     logMsg("Found " + allArtifacts.length + " artifacts in the index.", "log-ok");
 
     /* Extract unique versions */
@@ -362,7 +395,7 @@ async function fetchElasticIndex() {{
     document.getElementById("dl-controls").style.display = "flex";
   }} catch (err) {{
     logMsg("ERROR: " + err.message, "log-err");
-    logMsg("Your browser may be blocking the cross-origin request. Check the console for CORS errors.", "log-err");
+    logMsg("Check server logs for more details.", "log-err");
   }} finally {{
     btn.disabled = false;
     btn.textContent = "Fetch Available Versions";
@@ -403,13 +436,15 @@ async function startDownloadUpload() {{
   let ok = 0, fail = 0;
   for (let i = 0; i < matched.length; i++) {{
     const a = matched[i];
-    const url = ELASTIC_BASE + "/" + a.key;
-    logMsg("[" + (i + 1) + "/" + matched.length + "] Downloading " + a.key + " (" + humanSize(a.size) + ") …", "log-info");
+    logMsg("[" + (i + 1) + "/" + matched.length + "] Downloading " + a.key + " (" + humanSize(a.size) + ") via proxy …", "log-info");
     try {{
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      const blob = await resp.blob();
-      logMsg("  ✓ Downloaded. Uploading to server …", "log-ok");
+      const dlResp = await fetch(SUBPATH + "/proxy/elastic-download/" + encodeURIComponent(a.key));
+      if (!dlResp.ok) {{
+        const errText = await dlResp.text().catch(() => "");
+        throw new Error("Download failed — HTTP " + dlResp.status + (errText ? ": " + errText : ""));
+      }}
+      const blob = await dlResp.blob();
+      logMsg("  ✓ Downloaded (" + humanSize(blob.size) + "). Uploading to server …", "log-ok");
 
       /* Upload to our server */
       const fd = new FormData();
@@ -419,7 +454,8 @@ async function startDownloadUpload() {{
         logMsg("  ✓ Uploaded " + a.key + " to server.", "log-ok");
         ok++;
       }} else {{
-        throw new Error("Upload HTTP " + upResp.status);
+        const upErr = await upResp.text().catch(() => "");
+        throw new Error("Upload HTTP " + upResp.status + (upErr ? ": " + upErr : ""));
       }}
     }} catch (err) {{
       logMsg("  ✗ FAILED: " + err.message, "log-err");
@@ -594,20 +630,106 @@ async def artifact_file(version: str, filename: str):
 
 
 # ---------------------------------------------------------------------------
+# Proxy endpoints — bypass CORS by fetching Elastic S3 server-side
+# ---------------------------------------------------------------------------
+
+@router.get("/proxy/elastic-index")
+async def proxy_elastic_index():
+    """Fetch the Elastic S3 bucket listing and return parsed JSON."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        xml_data = _fetch_url(ELASTIC_BASE_URL, timeout=60)
+    except (URLError, OSError) as exc:
+        logger.error("Failed to fetch Elastic S3 index: %s", exc)
+        return Response(
+            content=f'{{"error": "Failed to fetch artifact index: {exc}"}}',
+            status_code=502,
+            media_type="application/json",
+        )
+
+    try:
+        root = ET.fromstring(xml_data)
+    except ET.ParseError as exc:
+        logger.error("Failed to parse Elastic S3 XML: %s", exc)
+        return Response(
+            content=f'{{"error": "Invalid XML from Elastic S3: {exc}"}}',
+            status_code=502,
+            media_type="application/json",
+        )
+
+    ns = {"s3": "http://doc.s3.amazonaws.com/2006-03-01"}
+    artifacts = []
+    for contents in root.findall("s3:Contents", ns):
+        key = contents.findtext("s3:Key", "", ns)
+        size = int(contents.findtext("s3:Size", "0", ns))
+        last_modified = contents.findtext("s3:LastModified", "", ns)
+        artifacts.append({"key": key, "size": size, "lastModified": last_modified})
+
+    # Fallback: try without namespace
+    if not artifacts:
+        for contents in root.findall("Contents"):
+            key = contents.findtext("Key", "")
+            size = int(contents.findtext("Size", "0"))
+            last_modified = contents.findtext("LastModified", "")
+            artifacts.append({"key": key, "size": size, "lastModified": last_modified})
+
+    import json
+    return Response(
+        content=json.dumps({"artifacts": artifacts}),
+        media_type="application/json",
+    )
+
+
+@router.get("/proxy/elastic-download/{artifact_key}")
+async def proxy_elastic_download(artifact_key: str):
+    """Stream a single artifact from Elastic S3 through the server."""
+    # Validate the key looks like a legit artifact filename
+    safe_key = _secure_filename(artifact_key)
+    if not safe_key.endswith(".zip"):
+        return Response(content="Invalid artifact key", status_code=400)
+
+    url = f"{ELASTIC_BASE_URL}/{safe_key}"
+    try:
+        data = _fetch_url(url, timeout=300)
+    except (URLError, OSError) as exc:
+        logger.error("Failed to download %s: %s", safe_key, exc)
+        return Response(content=f"Download failed: {exc}", status_code=502)
+
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe_key}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 app.include_router(router)
 
 if __name__ == "__main__":
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    scheme = "https" if SSL_CERTFILE else "http"
     print(f"Platform      : {platform.system()} ({platform.platform()})")
     print(f"Data directory: {DATA_DIR.resolve()}")
     print(f"Subpath       : {SUBPATH or '(none)'}")
-    print(f"Listening on  : http://{HOST}:{PORT}{SUBPATH}/")
-    print(f"Upload UI     : http://localhost:{PORT}{SUBPATH}/")
+    print(f"CORS origins  : {', '.join(CORS_ORIGINS)}")
+    print(f"SSL cert      : {SSL_CERTFILE or '(none)'}")
+    print(f"SSL verify out: {SSL_VERIFY}")
+    print(f"Listening on  : {scheme}://{HOST}:{PORT}{SUBPATH}/")
+    print(f"Upload UI     : {scheme}://localhost:{PORT}{SUBPATH}/")
     print()
+
+    ssl_kwargs = {}
+    if SSL_CERTFILE:
+        ssl_kwargs["ssl_certfile"] = SSL_CERTFILE
+    if SSL_KEYFILE:
+        ssl_kwargs["ssl_keyfile"] = SSL_KEYFILE
+
     uvicorn.run(
         app,
         host=HOST,
         port=PORT,
+        **ssl_kwargs,
     )
