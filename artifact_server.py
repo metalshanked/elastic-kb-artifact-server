@@ -179,6 +179,11 @@ HTML_TEMPLATE = """
   .btn-primary:hover {{ background: #005fa3; }}
   .btn-danger {{ background: #dc3545; color: #fff; font-size: .8rem; padding: .3rem .75rem; }}
   .btn-danger:hover {{ background: #b02a37; }}
+  .btn-secondary {{ background: #6c757d; color: #fff; }}
+  .btn-secondary:hover {{ background: #565e64; }}
+  .btn-success {{ background: #28a745; color: #fff; }}
+  .btn-success:hover {{ background: #218838; }}
+  .btn:disabled {{ opacity: .6; cursor: not-allowed; }}
   table {{ width: 100%; border-collapse: collapse; margin-top: .5rem; }}
   th, td {{ padding: .5rem .75rem; text-align: left; border-bottom: 1px solid var(--border); }}
   th {{ background: #f0f2f5; font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .03em; }}
@@ -192,6 +197,18 @@ HTML_TEMPLATE = """
   a:hover {{ text-decoration: underline; }}
   .empty {{ text-align: center; color: var(--muted); padding: 2rem; }}
   footer {{ margin-top: 2rem; text-align: center; color: var(--muted); font-size: .8rem; }}
+  /* Download from Elastic styles */
+  .dl-controls {{ display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; margin-top: .75rem; }}
+  .dl-controls select, .dl-controls label {{ font-size: .95rem; }}
+  .dl-controls select {{ padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px; min-width: 120px; }}
+  .dl-controls label {{ display: flex; align-items: center; gap: .35rem; cursor: pointer; }}
+  #dl-progress {{ margin-top: .75rem; display: none; }}
+  #dl-progress .progress-bar {{ height: 22px; background: #e9ecef; border-radius: 6px; overflow: hidden; margin: .5rem 0; }}
+  #dl-progress .progress-fill {{ height: 100%; background: var(--accent); transition: width .3s; display: flex; align-items: center; justify-content: center; color: #fff; font-size: .8rem; font-weight: 600; }}
+  #dl-log {{ max-height: 200px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: .82rem; background: #1a1a2e; color: #d4d4d4; padding: .75rem; border-radius: 6px; margin-top: .5rem; white-space: pre-wrap; word-break: break-all; }}
+  #dl-log .log-ok {{ color: #4ec9b0; }}
+  #dl-log .log-err {{ color: #f48771; }}
+  #dl-log .log-info {{ color: #9cdcfe; }}
 </style>
 </head>
 <body>
@@ -214,6 +231,27 @@ HTML_TEMPLATE = """
     </form>
   </div>
 
+  <!-- Download from Elastic -->
+  <div class="card">
+    <h2>🌐 Download from Elastic</h2>
+    <p style="margin-bottom:.75rem;color:var(--muted)">
+      Fetch official knowledge base artifacts from the Elastic S3 bucket directly through your browser,
+      then automatically upload them to this server. Your browser's proxy settings are used for the download.
+    </p>
+    <div>
+      <button id="dl-fetch-btn" class="btn btn-secondary" onclick="fetchElasticIndex()">Fetch Available Versions</button>
+    </div>
+    <div class="dl-controls" id="dl-controls" style="display:none">
+      <select id="dl-version"><option value="">— select version —</option></select>
+      <label><input type="checkbox" id="dl-multilingual"> Include multilingual</label>
+      <button id="dl-start-btn" class="btn btn-success" onclick="startDownloadUpload()">Download &amp; Upload</button>
+    </div>
+    <div id="dl-progress">
+      <div class="progress-bar"><div class="progress-fill" id="dl-progress-fill" style="width:0%"></div></div>
+      <div id="dl-log"></div>
+    </div>
+  </div>
+
   <!-- Versions -->
   <div class="card">
     <h2>📦 Hosted Versions</h2>
@@ -228,6 +266,178 @@ HTML_TEMPLATE = """
     {subpath_info}
   </footer>
 </div>
+<script>
+const ELASTIC_BASE = "https://kibana-knowledge-base-artifacts.elastic.co";
+const PRODUCTS = ["elasticsearch", "kibana", "observability", "security"];
+const SUBPATH = "{subpath}";
+let allArtifacts = [];
+
+function humanSize(bytes) {{
+  for (const u of ["B", "KB", "MB", "GB"]) {{
+    if (bytes < 1024) return bytes.toFixed(1) + " " + u;
+    bytes /= 1024;
+  }}
+  return bytes.toFixed(1) + " TB";
+}}
+
+function logMsg(text, cls) {{
+  const el = document.getElementById("dl-log");
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = text + "\\n";
+  el.appendChild(span);
+  el.scrollTop = el.scrollHeight;
+}}
+
+function setProgress(pct) {{
+  const fill = document.getElementById("dl-progress-fill");
+  fill.style.width = pct + "%";
+  fill.textContent = Math.round(pct) + "%";
+}}
+
+async function fetchElasticIndex() {{
+  const btn = document.getElementById("dl-fetch-btn");
+  btn.disabled = true;
+  btn.textContent = "Fetching…";
+  document.getElementById("dl-progress").style.display = "block";
+  document.getElementById("dl-log").innerHTML = "";
+  logMsg("Fetching artifact index from " + ELASTIC_BASE + " …", "log-info");
+
+  try {{
+    const resp = await fetch(ELASTIC_BASE);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const xmlText = await resp.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, "application/xml");
+
+    allArtifacts = [];
+    const contents = doc.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "Contents");
+    /* Fallback: try without namespace */
+    const items = contents.length > 0 ? contents : doc.getElementsByTagName("Contents");
+    for (const c of items) {{
+      const keyEl = c.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "Key")[0]
+                 || c.getElementsByTagName("Key")[0];
+      const sizeEl = c.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "Size")[0]
+                  || c.getElementsByTagName("Size")[0];
+      const modEl = c.getElementsByTagNameNS("http://doc.s3.amazonaws.com/2006-03-01", "LastModified")[0]
+                 || c.getElementsByTagName("LastModified")[0];
+      if (keyEl) {{
+        allArtifacts.push({{
+          key: keyEl.textContent,
+          size: parseInt(sizeEl ? sizeEl.textContent : "0", 10),
+          lastModified: modEl ? modEl.textContent : ""
+        }});
+      }}
+    }}
+    logMsg("Found " + allArtifacts.length + " artifacts in the index.", "log-ok");
+
+    /* Extract unique versions */
+    const versions = new Set();
+    for (const a of allArtifacts) {{
+      if (!a.key.startsWith("kb-product-doc-")) continue;
+      for (const prod of PRODUCTS) {{
+        const prefix = "kb-product-doc-" + prod + "-";
+        if (a.key.startsWith(prefix)) {{
+          const rest = a.key.slice(prefix.length);
+          const ver = rest.split(".zip")[0].split("--")[0];
+          if (ver && /^\\d/.test(ver)) versions.add(ver.replace(/\\.$/, ""));
+        }}
+      }}
+    }}
+    const sorted = Array.from(versions).sort((a, b) => {{
+      const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {{
+        if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+      }}
+      return 0;
+    }});
+    const sel = document.getElementById("dl-version");
+    sel.innerHTML = '<option value="">— select version —</option>';
+    for (const v of sorted) {{
+      const opt = document.createElement("option");
+      opt.value = v; opt.textContent = v;
+      sel.appendChild(opt);
+    }}
+    logMsg("Available versions: " + sorted.join(", "), "log-info");
+    document.getElementById("dl-controls").style.display = "flex";
+  }} catch (err) {{
+    logMsg("ERROR: " + err.message, "log-err");
+    logMsg("Your browser may be blocking the cross-origin request. Check the console for CORS errors.", "log-err");
+  }} finally {{
+    btn.disabled = false;
+    btn.textContent = "Fetch Available Versions";
+  }}
+}}
+
+function filterArtifacts(version, multilingual) {{
+  const matched = [];
+  for (const a of allArtifacts) {{
+    if (a.key.indexOf("-" + version + ".") < 0 && !a.key.endsWith("-" + version + ".zip")) continue;
+    const isMulti = a.key.indexOf("--.") >= 0 || a.key.indexOf("multilingual") >= 0;
+    if (isMulti && !multilingual) continue;
+    matched.push(a);
+  }}
+  return matched;
+}}
+
+async function startDownloadUpload() {{
+  const version = document.getElementById("dl-version").value;
+  if (!version) {{ alert("Please select a version."); return; }}
+  const multilingual = document.getElementById("dl-multilingual").checked;
+  const matched = filterArtifacts(version, multilingual);
+  if (matched.length === 0) {{
+    logMsg("No artifacts found for version " + version + ".", "log-err");
+    return;
+  }}
+
+  const btn = document.getElementById("dl-start-btn");
+  const fetchBtn = document.getElementById("dl-fetch-btn");
+  btn.disabled = true; fetchBtn.disabled = true;
+  btn.textContent = "Working…";
+  document.getElementById("dl-progress").style.display = "block";
+  setProgress(0);
+
+  const totalSize = matched.reduce((s, a) => s + a.size, 0);
+  logMsg("Downloading " + matched.length + " artifact(s) (" + humanSize(totalSize) + ") for version " + version + " …", "log-info");
+
+  let ok = 0, fail = 0;
+  for (let i = 0; i < matched.length; i++) {{
+    const a = matched[i];
+    const url = ELASTIC_BASE + "/" + a.key;
+    logMsg("[" + (i + 1) + "/" + matched.length + "] Downloading " + a.key + " (" + humanSize(a.size) + ") …", "log-info");
+    try {{
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const blob = await resp.blob();
+      logMsg("  ✓ Downloaded. Uploading to server …", "log-ok");
+
+      /* Upload to our server */
+      const fd = new FormData();
+      fd.append("files", blob, a.key);
+      const upResp = await fetch(SUBPATH + "/upload", {{ method: "POST", body: fd, redirect: "manual" }});
+      if (upResp.status === 303 || upResp.status === 200 || upResp.ok || upResp.type === "opaqueredirect") {{
+        logMsg("  ✓ Uploaded " + a.key + " to server.", "log-ok");
+        ok++;
+      }} else {{
+        throw new Error("Upload HTTP " + upResp.status);
+      }}
+    }} catch (err) {{
+      logMsg("  ✗ FAILED: " + err.message, "log-err");
+      fail++;
+    }}
+    setProgress(((i + 1) / matched.length) * 100);
+  }}
+
+  logMsg("", "");
+  logMsg("Done — " + ok + " uploaded, " + fail + " failed.", ok > 0 ? "log-ok" : "log-err");
+  btn.disabled = false; fetchBtn.disabled = false;
+  btn.textContent = "Download & Upload";
+  if (ok > 0) {{
+    logMsg("Reloading page in 2 seconds …", "log-info");
+    setTimeout(() => window.location.href = SUBPATH + "/", 2000);
+  }}
+}}
+</script>
 </body>
 </html>
 """

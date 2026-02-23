@@ -9,6 +9,7 @@ A lightweight, self-hosted artifact server for **Kibana AI Assistant knowledge b
 | Capability | Description |
 |---|---|
 | **Browser UI** | Single-page web interface to upload, list, and delete artifact zip files |
+| **Browser download** | Fetch official artifacts from the Elastic S3 bucket directly through the browser and auto-upload to the server — ideal when the backend has no internet access |
 | **S3-compatible listing** | Per-version XML bucket listing that Kibana understands out of the box |
 | **Auto version detection** | Extracts the version from the filename pattern `kb-product-doc-<product>-<major>.<minor>.zip` |
 | **Overwrite protection** | Re-uploading the same artifact for a version replaces the previous file |
@@ -86,7 +87,19 @@ xpack.productDocBase.artifactRepositoryUrl: "http://myserver:8080/artifacts/9.3"
 
 > All paths are relative to `ARTIFACT_SUBPATH` when configured.
 
-## Download Official Elastic Artifacts
+## Download from Elastic (Browser)
+
+The UI includes a **Download from Elastic** section that lets you fetch official artifacts directly through your browser and automatically upload them to the server — no CLI needed.
+
+1. Open the web UI at `http://localhost:8080`
+2. Click **Fetch Available Versions** — the browser fetches the S3 bucket listing from `https://kibana-knowledge-base-artifacts.elastic.co`
+3. Select a version from the dropdown, optionally enable **Include multilingual**
+4. Click **Download & Upload** — each artifact is downloaded in the browser and uploaded to the server behind the scenes
+5. The page reloads automatically when finished
+
+> **Why browser-side?** The FastAPI backend container may not have internet access to the Elastic S3 bucket. The browser (on the client machine) typically does, and it respects system/browser proxy settings automatically.
+
+## Download Official Elastic Artifacts (CLI)
 
 The included `download_elastic_artifacts.py` script fetches official knowledge base artifacts from the **Elastic S3 bucket** — useful for mirroring or seeding your server.
 
