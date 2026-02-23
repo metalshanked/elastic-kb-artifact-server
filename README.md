@@ -9,9 +9,9 @@ A lightweight, self-hosted artifact server for **Kibana AI Assistant knowledge b
 | Capability | Description |
 |---|---|
 | **Browser UI** | Single-page web interface to upload, list, and delete artifact zip files |
-| **Browser download** | Fetch official artifacts from the Elastic S3 bucket via server-side proxy and auto-upload — ideal when the backend has no internet access |
+| **Browser download** | Fetch official artifacts directly from the Elastic S3 bucket in the browser and auto-upload to the server — ideal when the backend has no internet access |
 | **CORS support** | Configurable CORS origins via `ARTIFACT_CORS_ORIGINS` for cross-origin API access |
-| **SSL / TLS** | Optional HTTPS with custom certificate/key; configurable SSL verification for outbound proxy requests |
+| **SSL / TLS** | Optional HTTPS serving with custom certificate/key |
 | **S3-compatible listing** | Per-version XML bucket listing that Kibana understands out of the box |
 | **Auto version detection** | Extracts the version from the filename pattern `kb-product-doc-<product>-<major>.<minor>.zip` |
 | **Overwrite protection** | Re-uploading the same artifact for a version replaces the previous file |
@@ -56,7 +56,6 @@ All settings are controlled via environment variables:
 | `ARTIFACT_SUBPATH` | *(empty)* | URL subpath prefix (e.g. `/kibana-artifacts`) |
 | `ARTIFACT_SSL_CERTFILE` | *(empty)* | Path to an SSL certificate file to enable HTTPS |
 | `ARTIFACT_SSL_KEYFILE` | *(empty)* | Path to the corresponding SSL private key file |
-| `ARTIFACT_SSL_VERIFY` | `1` | Set to `0` / `false` / `no` to skip SSL verification on outbound proxy requests (useful behind corporate MITM proxies) |
 | `ARTIFACT_CORS_ORIGINS` | `*` | Comma-separated list of allowed CORS origins, or `*` to allow all |
 
 ### Subpath example
@@ -90,22 +89,30 @@ xpack.productDocBase.artifactRepositoryUrl: "http://myserver:8080/artifacts/9.3"
 | `DELETE` | `/delete/{version}/{filename}` | Delete a specific artifact |
 | `GET` | `/artifacts/{version}/` | S3-compliant XML bucket listing for a version |
 | `GET` | `/artifacts/{version}/{filename}` | Download a specific artifact file |
-| `GET` | `/proxy/elastic-index` | Fetch & parse the Elastic S3 bucket listing (returns JSON) |
-| `GET` | `/proxy/elastic-download/{key}` | Download a single artifact from Elastic S3 through the server |
 
 > All paths are relative to `ARTIFACT_SUBPATH` when configured.
 
 ## Download from Elastic (Browser)
 
-The UI includes a **Download from Elastic** section that lets you fetch official artifacts via the server-side proxy and automatically store them — no CLI needed.
+The UI includes a **Download from Elastic** section that downloads official artifacts directly in your browser, then auto-uploads them to the server. This is ideal when the FastAPI backend container has **no internet access** but the client browser does.
+
+### Option A — Fetch version list automatically
 
 1. Open the web UI at `http://localhost:8080`
-2. Click **Fetch Available Versions** — the server fetches the S3 bucket listing from `https://kibana-knowledge-base-artifacts.elastic.co` and returns parsed JSON to the browser
+2. Click **Fetch Available Versions** — the browser fetches the S3 bucket listing directly from `https://kibana-knowledge-base-artifacts.elastic.co` and parses the XML
 3. Select a version from the dropdown, optionally enable **Include multilingual**
-4. Click **Download & Upload** — each artifact is downloaded through the server proxy and stored
+4. Click **Download & Upload** — each artifact is downloaded by the browser and uploaded to the server
 5. The page reloads automatically when finished
 
-> **How it works:** All requests to the Elastic S3 bucket are proxied through the FastAPI server (`/proxy/elastic-index` and `/proxy/elastic-download/{key}`), avoiding browser CORS restrictions. The server respects the `ARTIFACT_SSL_VERIFY` setting for outbound connections.
+### Option B — Enter version manually
+
+If CORS or network restrictions prevent the browser from fetching the S3 index:
+
+1. Type a version (e.g. `9.3`) into the manual version input field
+2. Optionally enable **Include multilingual**
+3. Click **Download & Upload** — the browser attempts to download each expected artifact (`kb-product-doc-{product}-{version}.zip`) and auto-uploads successes; missing files are skipped
+
+> **How it works:** All downloads happen client-side using the browser's `fetch()` API, which automatically uses your system / browser proxy settings and SSL configuration. No server-side internet access is required.
 
 ### SSL / HTTPS example
 
@@ -114,12 +121,6 @@ ARTIFACT_SSL_CERTFILE=/certs/server.crt \
 ARTIFACT_SSL_KEYFILE=/certs/server.key \
 python artifact_server.py
 # UI at https://localhost:8080/
-```
-
-To disable SSL verification for outbound requests to the Elastic S3 bucket (e.g. behind a corporate intercepting proxy):
-
-```bash
-ARTIFACT_SSL_VERIFY=0 python artifact_server.py
 ```
 
 ## Download Official Elastic Artifacts (CLI)

@@ -16,9 +16,9 @@ Features:
     - Serves zip files at /artifacts/<version>/<filename>
     - Lists all hosted versions on the main page
     - Configurable subpath via ARTIFACT_SUBPATH env var (e.g. /kibana-artifacts)
-    - Server-side proxy to fetch artifacts from Elastic S3 (avoids CORS issues)
+    - Client-side browser download from Elastic S3 (uses browser proxy/SSL settings)
     - CORS middleware with configurable allowed origins
-    - Optional SSL/TLS for HTTPS serving and outbound SSL verification control
+    - Optional SSL/TLS for HTTPS serving
 
 Run directly:
     pip install fastapi uvicorn python-multipart
@@ -37,12 +37,9 @@ Subpath example:
 import logging
 import os
 import re
-import ssl
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import Request as URLRequest, urlopen
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, File, Request, UploadFile
@@ -59,11 +56,9 @@ HOST = os.environ.get("ARTIFACT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ARTIFACT_PORT", "8080"))
 MAX_CONTENT_MB = int(os.environ.get("ARTIFACT_MAX_UPLOAD_MB", "500"))
 
-# SSL / TLS
+# SSL / TLS — enable HTTPS serving with custom certificates
 SSL_CERTFILE = os.environ.get("ARTIFACT_SSL_CERTFILE", "") or None
 SSL_KEYFILE = os.environ.get("ARTIFACT_SSL_KEYFILE", "") or None
-# Disable SSL verification for outbound proxy requests (e.g. corporate MITM proxies)
-SSL_VERIFY = os.environ.get("ARTIFACT_SSL_VERIFY", "1").lower() not in ("0", "false", "no")
 
 # CORS — comma-separated origins, or "*" to allow all
 _cors_origins = os.environ.get("ARTIFACT_CORS_ORIGINS", "*")
@@ -73,7 +68,7 @@ CORS_ORIGINS: list[str] = [o.strip() for o in _cors_origins.split(",") if o.stri
 _raw_subpath = os.environ.get("ARTIFACT_SUBPATH", "").strip("/")
 SUBPATH = f"/{_raw_subpath}" if _raw_subpath else ""
 
-ELASTIC_BASE_URL = "https://kibana-knowledge-base-artifacts.elastic.co"
+ELASTIC_BASE_URL = "https://kibana-knowledge-base-artifacts.elastic.co"  # used by client-side JS
 
 PRODUCTS = ["elasticsearch", "kibana", "observability", "security"]
 FILENAME_RE = re.compile(
@@ -186,23 +181,6 @@ def _base_url(request: Request) -> str:
     return f"{scheme}://{host}{SUBPATH}"
 
 
-def _ssl_context() -> ssl.SSLContext | None:
-    """Build an SSL context for outbound requests; respects ARTIFACT_SSL_VERIFY."""
-    if SSL_VERIFY:
-        return None  # use default verification
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-
-def _fetch_url(url: str, timeout: int = 60) -> bytes:
-    """Fetch a URL using urllib, honouring the SSL_VERIFY setting."""
-    ctx = _ssl_context()
-    req = URLRequest(url, headers={"User-Agent": "elastic-kb-artifact-server/1.0"})
-    with urlopen(req, timeout=timeout, context=ctx) as resp:
-        return resp.read()
-
 # ---------------------------------------------------------------------------
 # HTML Template (single-page UI)
 # ---------------------------------------------------------------------------
@@ -285,16 +263,22 @@ HTML_TEMPLATE = """
   <div class="card">
     <h2>🌐 Download from Elastic</h2>
     <p style="margin-bottom:.75rem;color:var(--muted)">
-      Fetch official knowledge base artifacts from the Elastic S3 bucket via the server proxy,
-      then automatically store them. Works even when your browser cannot reach the S3 bucket directly.
+      Fetch official knowledge base artifacts directly from the Elastic S3 bucket using your browser
+      (which has internet access), then automatically upload to this server. Uses your browser / system proxy settings.
     </p>
-    <div>
+    <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center">
       <button id="dl-fetch-btn" class="btn btn-secondary" onclick="fetchElasticIndex()">Fetch Available Versions</button>
+      <span style="color:var(--muted);font-size:.85rem">or enter manually:</span>
+      <input id="dl-manual-version" type="text" placeholder="e.g. 9.3" style="padding:.4rem .6rem;border:1px solid var(--border);border-radius:6px;width:80px;font-size:.95rem">
     </div>
     <div class="dl-controls" id="dl-controls" style="display:none">
       <select id="dl-version"><option value="">— select version —</option></select>
       <label><input type="checkbox" id="dl-multilingual"> Include multilingual</label>
       <button id="dl-start-btn" class="btn btn-success" onclick="startDownloadUpload()">Download &amp; Upload</button>
+    </div>
+    <div class="dl-controls" id="dl-manual-controls" style="display:none;margin-top:.5rem">
+      <label><input type="checkbox" id="dl-manual-multilingual"> Include multilingual</label>
+      <button id="dl-manual-start-btn" class="btn btn-success" onclick="startManualDownload()">Download &amp; Upload</button>
     </div>
     <div id="dl-progress">
       <div class="progress-bar"><div class="progress-fill" id="dl-progress-fill" style="width:0%"></div></div>
@@ -319,6 +303,7 @@ HTML_TEMPLATE = """
 <script>
 const PRODUCTS = ["elasticsearch", "kibana", "observability", "security"];
 const SUBPATH = "{subpath}";
+const ELASTIC_BASE = "{elastic_base_url}";
 let allArtifacts = [];
 
 function humanSize(bytes) {{
@@ -344,24 +329,44 @@ function setProgress(pct) {{
   fill.textContent = Math.round(pct) + "%";
 }}
 
+/* Show manual controls when the user types a version */
+document.getElementById("dl-manual-version").addEventListener("input", function() {{
+  document.getElementById("dl-manual-controls").style.display = this.value.trim() ? "flex" : "none";
+}});
+
 async function fetchElasticIndex() {{
   const btn = document.getElementById("dl-fetch-btn");
   btn.disabled = true;
   btn.textContent = "Fetching…";
   document.getElementById("dl-progress").style.display = "block";
   document.getElementById("dl-log").innerHTML = "";
-  logMsg("Fetching artifact index via server proxy …", "log-info");
+  logMsg("Fetching artifact index from " + ELASTIC_BASE + " (client-side) …", "log-info");
 
   try {{
-    const resp = await fetch(SUBPATH + "/proxy/elastic-index");
-    if (!resp.ok) {{
-      const errBody = await resp.text().catch(() => "");
-      throw new Error("HTTP " + resp.status + (errBody ? ": " + errBody : ""));
-    }}
-    const data = await resp.json();
-    if (data.error) throw new Error(data.error);
+    const resp = await fetch(ELASTIC_BASE);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const xmlText = await resp.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, "application/xml");
 
-    allArtifacts = data.artifacts || [];
+    /* Parse S3 XML — try with namespace first, then without */
+    const ns = "http://doc.s3.amazonaws.com/2006-03-01";
+    let contents = doc.getElementsByTagNameNS(ns, "Contents");
+    if (contents.length === 0) contents = doc.getElementsByTagName("Contents");
+
+    allArtifacts = [];
+    for (let i = 0; i < contents.length; i++) {{
+      const c = contents[i];
+      const keyEl = c.getElementsByTagNameNS(ns, "Key")[0] || c.getElementsByTagName("Key")[0];
+      const sizeEl = c.getElementsByTagNameNS(ns, "Size")[0] || c.getElementsByTagName("Size")[0];
+      const lmEl = c.getElementsByTagNameNS(ns, "LastModified")[0] || c.getElementsByTagName("LastModified")[0];
+      allArtifacts.push({{
+        key: keyEl ? keyEl.textContent : "",
+        size: sizeEl ? parseInt(sizeEl.textContent, 10) : 0,
+        lastModified: lmEl ? lmEl.textContent : ""
+      }});
+    }}
+
     logMsg("Found " + allArtifacts.length + " artifacts in the index.", "log-ok");
 
     /* Extract unique versions */
@@ -395,7 +400,11 @@ async function fetchElasticIndex() {{
     document.getElementById("dl-controls").style.display = "flex";
   }} catch (err) {{
     logMsg("ERROR: " + err.message, "log-err");
-    logMsg("Check server logs for more details.", "log-err");
+    if (err.message.includes("Failed to fetch") || err.message.includes("NetworkError") || err.message.includes("CORS")) {{
+      logMsg("This may be a CORS or network error. Use the manual version input instead.", "log-err");
+    }} else {{
+      logMsg("If the S3 bucket is unreachable, enter a version manually.", "log-err");
+    }}
   }} finally {{
     btn.disabled = false;
     btn.textContent = "Fetch Available Versions";
@@ -411,6 +420,39 @@ function filterArtifacts(version, multilingual) {{
     matched.push(a);
   }}
   return matched;
+}}
+
+/* Build the expected artifact filenames for a version (used by manual download) */
+function buildExpectedKeys(version, multilingual) {{
+  const keys = [];
+  for (const prod of PRODUCTS) {{
+    keys.push("kb-product-doc-" + prod + "-" + version + ".zip");
+    if (multilingual) {{
+      keys.push("kb-product-doc-" + prod + "-" + version + "--.zip");
+    }}
+  }}
+  return keys;
+}}
+
+/* Download a single file from Elastic and upload it to the server */
+async function downloadAndUpload(url, filename) {{
+  const dlResp = await fetch(url);
+  if (!dlResp.ok) {{
+    throw new Error("Download failed — HTTP " + dlResp.status);
+  }}
+  const blob = await dlResp.blob();
+  logMsg("  ✓ Downloaded (" + humanSize(blob.size) + "). Uploading to server …", "log-ok");
+
+  const fd = new FormData();
+  fd.append("files", blob, filename);
+  const upResp = await fetch(SUBPATH + "/upload", {{ method: "POST", body: fd, redirect: "manual" }});
+  if (upResp.status === 303 || upResp.status === 200 || upResp.ok || upResp.type === "opaqueredirect") {{
+    logMsg("  ✓ Uploaded " + filename + " to server.", "log-ok");
+    return true;
+  }} else {{
+    const upErr = await upResp.text().catch(() => "");
+    throw new Error("Upload HTTP " + upResp.status + (upErr ? ": " + upErr : ""));
+  }}
 }}
 
 async function startDownloadUpload() {{
@@ -436,27 +478,11 @@ async function startDownloadUpload() {{
   let ok = 0, fail = 0;
   for (let i = 0; i < matched.length; i++) {{
     const a = matched[i];
-    logMsg("[" + (i + 1) + "/" + matched.length + "] Downloading " + a.key + " (" + humanSize(a.size) + ") via proxy …", "log-info");
+    const url = ELASTIC_BASE + "/" + encodeURIComponent(a.key);
+    logMsg("[" + (i + 1) + "/" + matched.length + "] Downloading " + a.key + " (" + humanSize(a.size) + ") …", "log-info");
     try {{
-      const dlResp = await fetch(SUBPATH + "/proxy/elastic-download/" + encodeURIComponent(a.key));
-      if (!dlResp.ok) {{
-        const errText = await dlResp.text().catch(() => "");
-        throw new Error("Download failed — HTTP " + dlResp.status + (errText ? ": " + errText : ""));
-      }}
-      const blob = await dlResp.blob();
-      logMsg("  ✓ Downloaded (" + humanSize(blob.size) + "). Uploading to server …", "log-ok");
-
-      /* Upload to our server */
-      const fd = new FormData();
-      fd.append("files", blob, a.key);
-      const upResp = await fetch(SUBPATH + "/upload", {{ method: "POST", body: fd, redirect: "manual" }});
-      if (upResp.status === 303 || upResp.status === 200 || upResp.ok || upResp.type === "opaqueredirect") {{
-        logMsg("  ✓ Uploaded " + a.key + " to server.", "log-ok");
-        ok++;
-      }} else {{
-        const upErr = await upResp.text().catch(() => "");
-        throw new Error("Upload HTTP " + upResp.status + (upErr ? ": " + upErr : ""));
-      }}
+      await downloadAndUpload(url, a.key);
+      ok++;
     }} catch (err) {{
       logMsg("  ✗ FAILED: " + err.message, "log-err");
       fail++;
@@ -466,6 +492,56 @@ async function startDownloadUpload() {{
 
   logMsg("", "");
   logMsg("Done — " + ok + " uploaded, " + fail + " failed.", ok > 0 ? "log-ok" : "log-err");
+  btn.disabled = false; fetchBtn.disabled = false;
+  btn.textContent = "Download & Upload";
+  if (ok > 0) {{
+    logMsg("Reloading page in 2 seconds …", "log-info");
+    setTimeout(() => window.location.href = SUBPATH + "/", 2000);
+  }}
+}}
+
+async function startManualDownload() {{
+  const version = document.getElementById("dl-manual-version").value.trim();
+  if (!version || !/^\\d+\\.\\d+/.test(version)) {{
+    alert("Please enter a valid version (e.g. 9.3).");
+    return;
+  }}
+  const multilingual = document.getElementById("dl-manual-multilingual").checked;
+  const keys = buildExpectedKeys(version, multilingual);
+
+  const btn = document.getElementById("dl-manual-start-btn");
+  const fetchBtn = document.getElementById("dl-fetch-btn");
+  btn.disabled = true; fetchBtn.disabled = true;
+  btn.textContent = "Working…";
+  document.getElementById("dl-progress").style.display = "block";
+  document.getElementById("dl-log").innerHTML = "";
+  setProgress(0);
+
+  logMsg("Downloading " + keys.length + " expected artifact(s) for version " + version + " …", "log-info");
+  logMsg("(Skipping artifacts that don't exist on the server.)", "log-info");
+
+  let ok = 0, fail = 0, skip = 0;
+  for (let i = 0; i < keys.length; i++) {{
+    const key = keys[i];
+    const url = ELASTIC_BASE + "/" + encodeURIComponent(key);
+    logMsg("[" + (i + 1) + "/" + keys.length + "] Downloading " + key + " …", "log-info");
+    try {{
+      await downloadAndUpload(url, key);
+      ok++;
+    }} catch (err) {{
+      if (err.message.includes("403") || err.message.includes("404")) {{
+        logMsg("  ⊘ Skipped (not found on Elastic S3).", "log-info");
+        skip++;
+      }} else {{
+        logMsg("  ✗ FAILED: " + err.message, "log-err");
+        fail++;
+      }}
+    }}
+    setProgress(((i + 1) / keys.length) * 100);
+  }}
+
+  logMsg("", "");
+  logMsg("Done — " + ok + " uploaded, " + skip + " skipped, " + fail + " failed.", ok > 0 ? "log-ok" : "log-err");
   btn.disabled = false; fetchBtn.disabled = false;
   btn.textContent = "Download & Upload";
   if (ok > 0) {{
@@ -537,6 +613,7 @@ def _render_html(request: Request, flash_msg: str = "", flash_type: str = "succe
     return HTML_TEMPLATE.format(
         flash_html=flash_html,
         subpath=SUBPATH,
+        elastic_base_url=ELASTIC_BASE_URL,
         versions_html=versions_html,
         details_html=details_html,
         platform_info=platform.platform(),
@@ -630,80 +707,6 @@ async def artifact_file(version: str, filename: str):
 
 
 # ---------------------------------------------------------------------------
-# Proxy endpoints — bypass CORS by fetching Elastic S3 server-side
-# ---------------------------------------------------------------------------
-
-@router.get("/proxy/elastic-index")
-async def proxy_elastic_index():
-    """Fetch the Elastic S3 bucket listing and return parsed JSON."""
-    import xml.etree.ElementTree as ET
-
-    try:
-        xml_data = _fetch_url(ELASTIC_BASE_URL, timeout=60)
-    except (URLError, OSError) as exc:
-        logger.error("Failed to fetch Elastic S3 index: %s", exc)
-        return Response(
-            content=f'{{"error": "Failed to fetch artifact index: {exc}"}}',
-            status_code=502,
-            media_type="application/json",
-        )
-
-    try:
-        root = ET.fromstring(xml_data)
-    except ET.ParseError as exc:
-        logger.error("Failed to parse Elastic S3 XML: %s", exc)
-        return Response(
-            content=f'{{"error": "Invalid XML from Elastic S3: {exc}"}}',
-            status_code=502,
-            media_type="application/json",
-        )
-
-    ns = {"s3": "http://doc.s3.amazonaws.com/2006-03-01"}
-    artifacts = []
-    for contents in root.findall("s3:Contents", ns):
-        key = contents.findtext("s3:Key", "", ns)
-        size = int(contents.findtext("s3:Size", "0", ns))
-        last_modified = contents.findtext("s3:LastModified", "", ns)
-        artifacts.append({"key": key, "size": size, "lastModified": last_modified})
-
-    # Fallback: try without namespace
-    if not artifacts:
-        for contents in root.findall("Contents"):
-            key = contents.findtext("Key", "")
-            size = int(contents.findtext("Size", "0"))
-            last_modified = contents.findtext("LastModified", "")
-            artifacts.append({"key": key, "size": size, "lastModified": last_modified})
-
-    import json
-    return Response(
-        content=json.dumps({"artifacts": artifacts}),
-        media_type="application/json",
-    )
-
-
-@router.get("/proxy/elastic-download/{artifact_key}")
-async def proxy_elastic_download(artifact_key: str):
-    """Stream a single artifact from Elastic S3 through the server."""
-    # Validate the key looks like a legit artifact filename
-    safe_key = _secure_filename(artifact_key)
-    if not safe_key.endswith(".zip"):
-        return Response(content="Invalid artifact key", status_code=400)
-
-    url = f"{ELASTIC_BASE_URL}/{safe_key}"
-    try:
-        data = _fetch_url(url, timeout=300)
-    except (URLError, OSError) as exc:
-        logger.error("Failed to download %s: %s", safe_key, exc)
-        return Response(content=f"Download failed: {exc}", status_code=502)
-
-    return Response(
-        content=data,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{safe_key}"'},
-    )
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 app.include_router(router)
@@ -716,7 +719,6 @@ if __name__ == "__main__":
     print(f"Subpath       : {SUBPATH or '(none)'}")
     print(f"CORS origins  : {', '.join(CORS_ORIGINS)}")
     print(f"SSL cert      : {SSL_CERTFILE or '(none)'}")
-    print(f"SSL verify out: {SSL_VERIFY}")
     print(f"Listening on  : {scheme}://{HOST}:{PORT}{SUBPATH}/")
     print(f"Upload UI     : {scheme}://localhost:{PORT}{SUBPATH}/")
     print()
