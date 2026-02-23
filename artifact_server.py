@@ -16,9 +16,7 @@ Features:
     - Serves zip files at /artifacts/<version>/<filename>
     - Lists all hosted versions on the main page
     - Configurable subpath via ARTIFACT_SUBPATH env var (e.g. /kibana-artifacts)
-    - Client-side browser download from Elastic S3 (uses browser proxy/SSL settings)
-    - CORS middleware with configurable allowed origins
-    - Optional SSL/TLS for HTTPS serving
+    - Scalable multi-worker support via ARTIFACT_WORKERS env var
 
 Run directly:
     pip install fastapi uvicorn python-multipart
@@ -34,7 +32,6 @@ Subpath example:
     # Kibana config: http://<host>:8080/kibana-artifacts/artifacts/9.3
 """
 
-import logging
 import os
 import re
 import platform
@@ -43,10 +40,7 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import APIRouter, FastAPI, File, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
-
-logger = logging.getLogger("artifact_server")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,20 +49,11 @@ DATA_DIR = Path(os.environ.get("ARTIFACT_DATA_DIR", "/data"))
 HOST = os.environ.get("ARTIFACT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ARTIFACT_PORT", "8080"))
 MAX_CONTENT_MB = int(os.environ.get("ARTIFACT_MAX_UPLOAD_MB", "500"))
-
-# SSL / TLS — enable HTTPS serving with custom certificates
-SSL_CERTFILE = os.environ.get("ARTIFACT_SSL_CERTFILE", "") or None
-SSL_KEYFILE = os.environ.get("ARTIFACT_SSL_KEYFILE", "") or None
-
-# CORS — comma-separated origins, or "*" to allow all
-_cors_origins = os.environ.get("ARTIFACT_CORS_ORIGINS", "*")
-CORS_ORIGINS: list[str] = [o.strip() for o in _cors_origins.split(",") if o.strip()]
+WORKERS = int(os.environ.get("ARTIFACT_WORKERS", "1"))
 
 # Subpath support — strip/add leading/trailing slashes for consistency
 _raw_subpath = os.environ.get("ARTIFACT_SUBPATH", "").strip("/")
 SUBPATH = f"/{_raw_subpath}" if _raw_subpath else ""
-
-ELASTIC_BASE_URL = "https://kibana-knowledge-base-artifacts.elastic.co"  # used by client-side JS
 
 PRODUCTS = ["elasticsearch", "kibana", "observability", "security"]
 FILENAME_RE = re.compile(
@@ -80,17 +65,8 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
-
-# CORS middleware — allows the UI / external clients to call the API
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 router = APIRouter(prefix=SUBPATH)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -207,11 +183,8 @@ HTML_TEMPLATE = """
   .btn-primary:hover {{ background: #005fa3; }}
   .btn-danger {{ background: #dc3545; color: #fff; font-size: .8rem; padding: .3rem .75rem; }}
   .btn-danger:hover {{ background: #b02a37; }}
-  .btn-secondary {{ background: #6c757d; color: #fff; }}
-  .btn-secondary:hover {{ background: #565e64; }}
-  .btn-success {{ background: #28a745; color: #fff; }}
-  .btn-success:hover {{ background: #218838; }}
-  .btn:disabled {{ opacity: .6; cursor: not-allowed; }}
+  .btn-outline {{ background: transparent; border: 1px solid var(--border); color: var(--text); padding: .4rem .75rem; font-size: .85rem; }}
+  .btn-outline:hover {{ background: #f0f2f5; }}
   table {{ width: 100%; border-collapse: collapse; margin-top: .5rem; }}
   th, td {{ padding: .5rem .75rem; text-align: left; border-bottom: 1px solid var(--border); }}
   th {{ background: #f0f2f5; font-weight: 600; font-size: .85rem; text-transform: uppercase; letter-spacing: .03em; }}
@@ -225,18 +198,6 @@ HTML_TEMPLATE = """
   a:hover {{ text-decoration: underline; }}
   .empty {{ text-align: center; color: var(--muted); padding: 2rem; }}
   footer {{ margin-top: 2rem; text-align: center; color: var(--muted); font-size: .8rem; }}
-  /* Download from Elastic styles */
-  .dl-controls {{ display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; margin-top: .75rem; }}
-  .dl-controls select, .dl-controls label {{ font-size: .95rem; }}
-  .dl-controls select {{ padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 6px; min-width: 120px; }}
-  .dl-controls label {{ display: flex; align-items: center; gap: .35rem; cursor: pointer; }}
-  #dl-progress {{ margin-top: .75rem; display: none; }}
-  #dl-progress .progress-bar {{ height: 22px; background: #e9ecef; border-radius: 6px; overflow: hidden; margin: .5rem 0; }}
-  #dl-progress .progress-fill {{ height: 100%; background: var(--accent); transition: width .3s; display: flex; align-items: center; justify-content: center; color: #fff; font-size: .8rem; font-weight: 600; }}
-  #dl-log {{ max-height: 200px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: .82rem; background: #1a1a2e; color: #d4d4d4; padding: .75rem; border-radius: 6px; margin-top: .5rem; white-space: pre-wrap; word-break: break-all; }}
-  #dl-log .log-ok {{ color: #4ec9b0; }}
-  #dl-log .log-err {{ color: #f48771; }}
-  #dl-log .log-info {{ color: #9cdcfe; }}
 </style>
 </head>
 <body>
@@ -245,6 +206,22 @@ HTML_TEMPLATE = """
   <p class="subtitle">Upload &amp; serve Kibana AI Assistant knowledge base artifacts (S3-compliant)</p>
 
   {flash_html}
+
+  <!-- Generate Download Links -->
+  <div class="card" style="background: #f8fafd; border-color: #cce0ff;">
+    <h2>📥 Get Artifacts from Elastic</h2>
+    <p style="margin-bottom:.75rem;color:var(--muted); font-size:.9rem;">
+      Need artifacts? Enter a version below to generate direct secure download links from Elastic. 
+      Click the buttons to download them to your computer, then upload them via the form below.
+    </p>
+    <div style="display:flex; flex-wrap:wrap; gap:.75rem; align-items:center; margin-bottom: 1rem;">
+      <input type="text" id="dl-version" placeholder="e.g. 9.3" style="padding:.5rem; border:1px solid var(--border); border-radius:4px; width:120px;">
+      <label style="font-size:.9rem; cursor:pointer;"><input type="checkbox" id="dl-multi"> Include multilingual</label>
+    </div>
+    <div id="dl-links" style="display:flex; flex-wrap:wrap; gap:.5rem;">
+      <span style="color:var(--muted); font-size:.85rem; font-style:italic;">Enter a version above to show links...</span>
+    </div>
+  </div>
 
   <!-- Upload -->
   <div class="card">
@@ -257,33 +234,6 @@ HTML_TEMPLATE = """
       <input type="file" name="files" accept=".zip" multiple required>
       <button type="submit" class="btn btn-primary">Upload</button>
     </form>
-  </div>
-
-  <!-- Download from Elastic -->
-  <div class="card">
-    <h2>🌐 Download from Elastic</h2>
-    <p style="margin-bottom:.75rem;color:var(--muted)">
-      Fetch official knowledge base artifacts directly from the Elastic S3 bucket using your browser
-      (which has internet access), then automatically upload to this server. Uses your browser / system proxy settings.
-    </p>
-    <div style="display:flex;flex-wrap:wrap;gap:.75rem;align-items:center">
-      <button id="dl-fetch-btn" class="btn btn-secondary" onclick="fetchElasticIndex()">Fetch Available Versions</button>
-      <span style="color:var(--muted);font-size:.85rem">or enter manually:</span>
-      <input id="dl-manual-version" type="text" placeholder="e.g. 9.3" style="padding:.4rem .6rem;border:1px solid var(--border);border-radius:6px;width:80px;font-size:.95rem">
-    </div>
-    <div class="dl-controls" id="dl-controls" style="display:none">
-      <select id="dl-version"><option value="">— select version —</option></select>
-      <label><input type="checkbox" id="dl-multilingual"> Include multilingual</label>
-      <button id="dl-start-btn" class="btn btn-success" onclick="startDownloadUpload()">Download &amp; Upload</button>
-    </div>
-    <div class="dl-controls" id="dl-manual-controls" style="display:none;margin-top:.5rem">
-      <label><input type="checkbox" id="dl-manual-multilingual"> Include multilingual</label>
-      <button id="dl-manual-start-btn" class="btn btn-success" onclick="startManualDownload()">Download &amp; Upload</button>
-    </div>
-    <div id="dl-progress">
-      <div class="progress-bar"><div class="progress-fill" id="dl-progress-fill" style="width:0%"></div></div>
-      <div id="dl-log"></div>
-    </div>
   </div>
 
   <!-- Versions -->
@@ -300,255 +250,46 @@ HTML_TEMPLATE = """
     {subpath_info}
   </footer>
 </div>
+
 <script>
-const PRODUCTS = ["elasticsearch", "kibana", "observability", "security"];
-const SUBPATH = "{subpath}";
-const ELASTIC_BASE = "{elastic_base_url}";
-let allArtifacts = [];
+  // Link Generator Script (Runs completely in browser, ignores CORS)
+  const ELASTIC_BASE = "https://kibana-knowledge-base-artifacts.elastic.co";
+  const PRODUCTS = ["elasticsearch", "kibana", "observability", "security"];
 
-function humanSize(bytes) {{
-  for (const u of ["B", "KB", "MB", "GB"]) {{
-    if (bytes < 1024) return bytes.toFixed(1) + " " + u;
-    bytes /= 1024;
-  }}
-  return bytes.toFixed(1) + " TB";
-}}
+  const vInput = document.getElementById("dl-version");
+  const mInput = document.getElementById("dl-multi");
+  const linkContainer = document.getElementById("dl-links");
 
-function logMsg(text, cls) {{
-  const el = document.getElementById("dl-log");
-  const span = document.createElement("span");
-  if (cls) span.className = cls;
-  span.textContent = text + "\\n";
-  el.appendChild(span);
-  el.scrollTop = el.scrollHeight;
-}}
-
-function setProgress(pct) {{
-  const fill = document.getElementById("dl-progress-fill");
-  fill.style.width = pct + "%";
-  fill.textContent = Math.round(pct) + "%";
-}}
-
-/* Show manual controls when the user types a version */
-document.getElementById("dl-manual-version").addEventListener("input", function() {{
-  document.getElementById("dl-manual-controls").style.display = this.value.trim() ? "flex" : "none";
-}});
-
-async function fetchElasticIndex() {{
-  const btn = document.getElementById("dl-fetch-btn");
-  btn.disabled = true;
-  btn.textContent = "Fetching…";
-  document.getElementById("dl-progress").style.display = "block";
-  document.getElementById("dl-log").innerHTML = "";
-  logMsg("Fetching artifact index from " + ELASTIC_BASE + " (client-side) …", "log-info");
-
-  try {{
-    const resp = await fetch(ELASTIC_BASE);
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const xmlText = await resp.text();
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(xmlText, "application/xml");
-
-    /* Parse S3 XML — try with namespace first, then without */
-    const ns = "http://doc.s3.amazonaws.com/2006-03-01";
-    let contents = doc.getElementsByTagNameNS(ns, "Contents");
-    if (contents.length === 0) contents = doc.getElementsByTagName("Contents");
-
-    allArtifacts = [];
-    for (let i = 0; i < contents.length; i++) {{
-      const c = contents[i];
-      const keyEl = c.getElementsByTagNameNS(ns, "Key")[0] || c.getElementsByTagName("Key")[0];
-      const sizeEl = c.getElementsByTagNameNS(ns, "Size")[0] || c.getElementsByTagName("Size")[0];
-      const lmEl = c.getElementsByTagNameNS(ns, "LastModified")[0] || c.getElementsByTagName("LastModified")[0];
-      allArtifacts.push({{
-        key: keyEl ? keyEl.textContent : "",
-        size: sizeEl ? parseInt(sizeEl.textContent, 10) : 0,
-        lastModified: lmEl ? lmEl.textContent : ""
-      }});
+  function updateLinks() {{
+    const v = vInput.value.trim();
+    if (!v || !/^\\d+\\.\\d+/.test(v)) {{
+      linkContainer.innerHTML = '<span style="color:var(--muted); font-size:.85rem; font-style:italic;">Enter a valid version (e.g., 9.3) to show links...</span>';
+      return;
     }}
 
-    logMsg("Found " + allArtifacts.length + " artifacts in the index.", "log-ok");
+    linkContainer.innerHTML = "";
+    const multi = mInput.checked;
 
-    /* Extract unique versions */
-    const versions = new Set();
-    for (const a of allArtifacts) {{
-      if (!a.key.startsWith("kb-product-doc-")) continue;
-      for (const prod of PRODUCTS) {{
-        const prefix = "kb-product-doc-" + prod + "-";
-        if (a.key.startsWith(prefix)) {{
-          const rest = a.key.slice(prefix.length);
-          const ver = rest.split(".zip")[0].split("--")[0];
-          if (ver && /^\\d/.test(ver)) versions.add(ver.replace(/\\.$/, ""));
-        }}
+    PRODUCTS.forEach(p => {{
+      createLink(`kb-product-doc-${{p}}-${{v}}.zip`);
+      if (multi) {{
+        createLink(`kb-product-doc-${{p}}-${{v}}--.zip`);
       }}
-    }}
-    const sorted = Array.from(versions).sort((a, b) => {{
-      const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
-      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {{
-        if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
-      }}
-      return 0;
     }});
-    const sel = document.getElementById("dl-version");
-    sel.innerHTML = '<option value="">— select version —</option>';
-    for (const v of sorted) {{
-      const opt = document.createElement("option");
-      opt.value = v; opt.textContent = v;
-      sel.appendChild(opt);
-    }}
-    logMsg("Available versions: " + sorted.join(", "), "log-info");
-    document.getElementById("dl-controls").style.display = "flex";
-  }} catch (err) {{
-    logMsg("ERROR: " + err.message, "log-err");
-    if (err.message.includes("Failed to fetch") || err.message.includes("NetworkError") || err.message.includes("CORS")) {{
-      logMsg("This may be a CORS or network error. Use the manual version input instead.", "log-err");
-    }} else {{
-      logMsg("If the S3 bucket is unreachable, enter a version manually.", "log-err");
-    }}
-  }} finally {{
-    btn.disabled = false;
-    btn.textContent = "Fetch Available Versions";
-  }}
-}}
-
-function filterArtifacts(version, multilingual) {{
-  const matched = [];
-  for (const a of allArtifacts) {{
-    if (a.key.indexOf("-" + version + ".") < 0 && !a.key.endsWith("-" + version + ".zip")) continue;
-    const isMulti = a.key.indexOf("--.") >= 0 || a.key.indexOf("multilingual") >= 0;
-    if (isMulti && !multilingual) continue;
-    matched.push(a);
-  }}
-  return matched;
-}}
-
-/* Build the expected artifact filenames for a version (used by manual download) */
-function buildExpectedKeys(version, multilingual) {{
-  const keys = [];
-  for (const prod of PRODUCTS) {{
-    keys.push("kb-product-doc-" + prod + "-" + version + ".zip");
-    if (multilingual) {{
-      keys.push("kb-product-doc-" + prod + "-" + version + "--.zip");
-    }}
-  }}
-  return keys;
-}}
-
-/* Download a single file from Elastic and upload it to the server */
-async function downloadAndUpload(url, filename) {{
-  const dlResp = await fetch(url);
-  if (!dlResp.ok) {{
-    throw new Error("Download failed — HTTP " + dlResp.status);
-  }}
-  const blob = await dlResp.blob();
-  logMsg("  ✓ Downloaded (" + humanSize(blob.size) + "). Uploading to server …", "log-ok");
-
-  const fd = new FormData();
-  fd.append("files", blob, filename);
-  const upResp = await fetch(SUBPATH + "/upload", {{ method: "POST", body: fd, redirect: "manual" }});
-  if (upResp.status === 303 || upResp.status === 200 || upResp.ok || upResp.type === "opaqueredirect") {{
-    logMsg("  ✓ Uploaded " + filename + " to server.", "log-ok");
-    return true;
-  }} else {{
-    const upErr = await upResp.text().catch(() => "");
-    throw new Error("Upload HTTP " + upResp.status + (upErr ? ": " + upErr : ""));
-  }}
-}}
-
-async function startDownloadUpload() {{
-  const version = document.getElementById("dl-version").value;
-  if (!version) {{ alert("Please select a version."); return; }}
-  const multilingual = document.getElementById("dl-multilingual").checked;
-  const matched = filterArtifacts(version, multilingual);
-  if (matched.length === 0) {{
-    logMsg("No artifacts found for version " + version + ".", "log-err");
-    return;
   }}
 
-  const btn = document.getElementById("dl-start-btn");
-  const fetchBtn = document.getElementById("dl-fetch-btn");
-  btn.disabled = true; fetchBtn.disabled = true;
-  btn.textContent = "Working…";
-  document.getElementById("dl-progress").style.display = "block";
-  setProgress(0);
-
-  const totalSize = matched.reduce((s, a) => s + a.size, 0);
-  logMsg("Downloading " + matched.length + " artifact(s) (" + humanSize(totalSize) + ") for version " + version + " …", "log-info");
-
-  let ok = 0, fail = 0;
-  for (let i = 0; i < matched.length; i++) {{
-    const a = matched[i];
-    const url = ELASTIC_BASE + "/" + encodeURIComponent(a.key);
-    logMsg("[" + (i + 1) + "/" + matched.length + "] Downloading " + a.key + " (" + humanSize(a.size) + ") …", "log-info");
-    try {{
-      await downloadAndUpload(url, a.key);
-      ok++;
-    }} catch (err) {{
-      logMsg("  ✗ FAILED: " + err.message, "log-err");
-      fail++;
-    }}
-    setProgress(((i + 1) / matched.length) * 100);
+  function createLink(filename) {{
+    const a = document.createElement("a");
+    a.href = `${{ELASTIC_BASE}}/${{filename}}`;
+    a.className = "btn btn-outline";
+    a.setAttribute("download", filename); // Hints to browser to download instead of navigate
+    a.target = "_blank"; // Fallback to open in new tab if download hint fails
+    a.innerHTML = `⬇️ ${{filename}}`;
+    linkContainer.appendChild(a);
   }}
 
-  logMsg("", "");
-  logMsg("Done — " + ok + " uploaded, " + fail + " failed.", ok > 0 ? "log-ok" : "log-err");
-  btn.disabled = false; fetchBtn.disabled = false;
-  btn.textContent = "Download & Upload";
-  if (ok > 0) {{
-    logMsg("Reloading page in 2 seconds …", "log-info");
-    setTimeout(() => window.location.href = SUBPATH + "/", 2000);
-  }}
-}}
-
-async function startManualDownload() {{
-  const version = document.getElementById("dl-manual-version").value.trim();
-  if (!version || !/^\\d+\\.\\d+/.test(version)) {{
-    alert("Please enter a valid version (e.g. 9.3).");
-    return;
-  }}
-  const multilingual = document.getElementById("dl-manual-multilingual").checked;
-  const keys = buildExpectedKeys(version, multilingual);
-
-  const btn = document.getElementById("dl-manual-start-btn");
-  const fetchBtn = document.getElementById("dl-fetch-btn");
-  btn.disabled = true; fetchBtn.disabled = true;
-  btn.textContent = "Working…";
-  document.getElementById("dl-progress").style.display = "block";
-  document.getElementById("dl-log").innerHTML = "";
-  setProgress(0);
-
-  logMsg("Downloading " + keys.length + " expected artifact(s) for version " + version + " …", "log-info");
-  logMsg("(Skipping artifacts that don't exist on the server.)", "log-info");
-
-  let ok = 0, fail = 0, skip = 0;
-  for (let i = 0; i < keys.length; i++) {{
-    const key = keys[i];
-    const url = ELASTIC_BASE + "/" + encodeURIComponent(key);
-    logMsg("[" + (i + 1) + "/" + keys.length + "] Downloading " + key + " …", "log-info");
-    try {{
-      await downloadAndUpload(url, key);
-      ok++;
-    }} catch (err) {{
-      if (err.message.includes("403") || err.message.includes("404")) {{
-        logMsg("  ⊘ Skipped (not found on Elastic S3).", "log-info");
-        skip++;
-      }} else {{
-        logMsg("  ✗ FAILED: " + err.message, "log-err");
-        fail++;
-      }}
-    }}
-    setProgress(((i + 1) / keys.length) * 100);
-  }}
-
-  logMsg("", "");
-  logMsg("Done — " + ok + " uploaded, " + skip + " skipped, " + fail + " failed.", ok > 0 ? "log-ok" : "log-err");
-  btn.disabled = false; fetchBtn.disabled = false;
-  btn.textContent = "Download & Upload";
-  if (ok > 0) {{
-    logMsg("Reloading page in 2 seconds …", "log-info");
-    setTimeout(() => window.location.href = SUBPATH + "/", 2000);
-  }}
-}}
+  vInput.addEventListener("input", updateLinks);
+  mInput.addEventListener("change", updateLinks);
 </script>
 </body>
 </html>
@@ -613,13 +354,13 @@ def _render_html(request: Request, flash_msg: str = "", flash_type: str = "succe
     return HTML_TEMPLATE.format(
         flash_html=flash_html,
         subpath=SUBPATH,
-        elastic_base_url=ELASTIC_BASE_URL,
         versions_html=versions_html,
         details_html=details_html,
         platform_info=platform.platform(),
         data_dir=str(DATA_DIR.resolve()),
         subpath_info=subpath_info,
     )
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -713,25 +454,18 @@ app.include_router(router)
 
 if __name__ == "__main__":
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    scheme = "https" if SSL_CERTFILE else "http"
     print(f"Platform      : {platform.system()} ({platform.platform()})")
     print(f"Data directory: {DATA_DIR.resolve()}")
     print(f"Subpath       : {SUBPATH or '(none)'}")
-    print(f"CORS origins  : {', '.join(CORS_ORIGINS)}")
-    print(f"SSL cert      : {SSL_CERTFILE or '(none)'}")
-    print(f"Listening on  : {scheme}://{HOST}:{PORT}{SUBPATH}/")
-    print(f"Upload UI     : {scheme}://localhost:{PORT}{SUBPATH}/")
+    print(f"Workers       : {WORKERS}")
+    print(f"Listening on  : http://{HOST}:{PORT}{SUBPATH}/")
+    print(f"Upload UI     : http://localhost:{PORT}{SUBPATH}/")
     print()
 
-    ssl_kwargs = {}
-    if SSL_CERTFILE:
-        ssl_kwargs["ssl_certfile"] = SSL_CERTFILE
-    if SSL_KEYFILE:
-        ssl_kwargs["ssl_keyfile"] = SSL_KEYFILE
-
+    # Run using the import string "artifact_server:app" to enable multiple workers
     uvicorn.run(
-        app,
+        "artifact_server:app",
         host=HOST,
         port=PORT,
-        **ssl_kwargs,
+        workers=WORKERS,
     )
