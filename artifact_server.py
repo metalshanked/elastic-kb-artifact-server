@@ -59,7 +59,8 @@ UI_USERNAME = os.environ.get("UI_USERNAME", "").strip()
 UI_PASSWORD = os.environ.get("UI_PASSWORD", "").strip()
 UI_AUTH_ENABLED = bool(UI_USERNAME and UI_PASSWORD)
 UI_COOKIE_NAME = "ui_session"
-UI_SESSION_SECRET = os.environ.get("UI_SESSION_SECRET", f"{UI_USERNAME}:{UI_PASSWORD}")
+_raw_ui_session_secret = os.environ.get("UI_SESSION_SECRET", "").strip()
+UI_SESSION_SECRET = _raw_ui_session_secret or f"{UI_USERNAME}:{UI_PASSWORD}"
 
 # Subpath support — strip/add leading/trailing slashes for consistency
 _raw_subpath = os.environ.get("ARTIFACT_SUBPATH", "").strip("/")
@@ -365,19 +366,19 @@ LOGIN_TEMPLATE = """
 <link rel="icon" href="data:,">
 <title>Login - Elastic KB Artifact Server</title>
 <style>
-  :root { --bg: #f5f7fa; --card: #fff; --accent: #0077cc; --border: #dde1e6; --text: #1a1a2e; --muted: #6b7280; }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; }
-  .wrap { min-height: calc(100vh - 4rem); display: flex; align-items: center; justify-content: center; }
-  .card { width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; }
-  h1 { font-size: 1.4rem; margin-bottom: .5rem; }
-  .subtitle { color: var(--muted); margin-bottom: 1rem; }
-  .field { margin-bottom: .9rem; }
-  label { display: block; font-size: .9rem; margin-bottom: .2rem; }
-  input { width: 100%; padding: .55rem .65rem; border: 1px solid var(--border); border-radius: 6px; font-size: .95rem; }
-  .btn { width: 100%; padding: .55rem .65rem; border: none; border-radius: 6px; cursor: pointer; font-size: .95rem; font-weight: 500; background: var(--accent); color: #fff; }
-  .btn:hover { background: #005fa3; }
-  .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; border-radius: 6px; padding: .55rem .65rem; margin-bottom: .9rem; }
+  :root {{ --bg: #f5f7fa; --card: #fff; --accent: #0077cc; --border: #dde1e6; --text: #1a1a2e; --muted: #6b7280; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; }}
+  .wrap {{ min-height: calc(100vh - 4rem); display: flex; align-items: center; justify-content: center; }}
+  .card {{ width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; }}
+  h1 {{ font-size: 1.4rem; margin-bottom: .5rem; }}
+  .subtitle {{ color: var(--muted); margin-bottom: 1rem; }}
+  .field {{ margin-bottom: .9rem; }}
+  label {{ display: block; font-size: .9rem; margin-bottom: .2rem; }}
+  input {{ width: 100%; padding: .55rem .65rem; border: 1px solid var(--border); border-radius: 6px; font-size: .95rem; }}
+  .btn {{ width: 100%; padding: .55rem .65rem; border: none; border-radius: 6px; cursor: pointer; font-size: .95rem; font-weight: 500; background: var(--accent); color: #fff; }}
+  .btn:hover {{ background: #005fa3; }}
+  .error {{ background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; border-radius: 6px; padding: .55rem .65rem; margin-bottom: .9rem; }}
 </style>
 </head>
 <body>
@@ -563,6 +564,7 @@ async def login_page(request: Request, next: str = ""):
 
 @router.post("/login")
 async def login_submit(
+    request: Request,
     username: str = Form(""),
     password: str = Form(""),
     next: str = Form(""),
@@ -581,7 +583,7 @@ async def login_submit(
         key=UI_COOKIE_NAME,
         value=_make_session_cookie_value(username),
         httponly=True,
-        secure=False,
+        secure=request.headers.get("x-forwarded-proto", request.url.scheme) == "https",
         samesite="lax",
         path=(SUBPATH or "/"),
     )
