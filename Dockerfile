@@ -5,7 +5,7 @@ LABEL description="Elastic KB Artifact Server — upload & serve Kibana AI Assis
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi==0.115.* uvicorn[standard]==0.34.* python-multipart==0.0.*
+RUN pip install --no-cache-dir fastapi==0.132.1.* uvicorn[standard]==0.41.* python-multipart==0.0.*
 
 COPY artifact_server.py .
 
