@@ -61,6 +61,7 @@ UI_AUTH_ENABLED = bool(UI_USERNAME and UI_PASSWORD)
 UI_COOKIE_NAME = "ui_session"
 _raw_ui_session_secret = os.environ.get("UI_SESSION_SECRET", "").strip()
 UI_SESSION_SECRET = _raw_ui_session_secret or f"{UI_USERNAME}:{UI_PASSWORD}"
+UI_CSRF_COOKIE_NAME = "ui_csrf"
 
 # Subpath support — strip/add leading/trailing slashes for consistency
 _raw_subpath = os.environ.get("ARTIFACT_SUBPATH", "").strip("/")
@@ -178,6 +179,28 @@ def _make_session_cookie_value(username: str) -> str:
     return f"{payload}.{sig}"
 
 
+def _make_csrf_token() -> str:
+    nonce = urlsafe_b64encode(secrets.token_bytes(24)).decode("ascii")
+    sig = hmac.new(
+        UI_SESSION_SECRET.encode("utf-8"),
+        nonce.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{nonce}.{sig}"
+
+
+def _is_valid_csrf_token(token: str | None) -> bool:
+    if not token or "." not in token:
+        return False
+    nonce, sig = token.rsplit(".", 1)
+    expected = hmac.new(
+        UI_SESSION_SECRET.encode("utf-8"),
+        nonce.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
 def _is_valid_session_cookie(cookie_value: str | None) -> bool:
     if not UI_AUTH_ENABLED:
         return True
@@ -216,6 +239,33 @@ def _safe_next_path(next_path: str) -> str:
     if next_path.startswith("/") and not next_path.startswith("//"):
         return next_path
     return f"{SUBPATH}/"
+
+
+def _get_or_create_csrf_token(request: Request) -> str:
+    token = request.cookies.get(UI_CSRF_COOKIE_NAME)
+    if _is_valid_csrf_token(token):
+        return token
+    return _make_csrf_token()
+
+
+def _set_csrf_cookie(request: Request, response: Response, csrf_token: str):
+    response.set_cookie(
+        key=UI_CSRF_COOKIE_NAME,
+        value=csrf_token,
+        httponly=True,
+        secure=request.headers.get("x-forwarded-proto", request.url.scheme) == "https",
+        samesite="lax",
+        path=(SUBPATH or "/"),
+    )
+
+
+def _is_csrf_valid(request: Request, submitted_token: str) -> bool:
+    cookie_token = request.cookies.get(UI_CSRF_COOKIE_NAME)
+    if not _is_valid_csrf_token(cookie_token):
+        return False
+    if not _is_valid_csrf_token(submitted_token):
+        return False
+    return hmac.compare_digest(cookie_token, submitted_token)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +316,7 @@ HTML_TEMPLATE = """
 <div class="container">
   <h1>🗄️ Elastic KB Artifact Server</h1>
   <p class="subtitle">Upload &amp; serve Kibana AI Assistant knowledge base artifacts (S3-compliant)</p>
-
+  {logout_html}
   {flash_html}
 
   <!-- Generate Download Links -->
@@ -293,6 +343,7 @@ HTML_TEMPLATE = """
       Version is auto-detected from the filename. Same-version files are overwritten.
     </p>
     <form class="upload-form" method="POST" action="{subpath}/upload" enctype="multipart/form-data">
+      <input type="hidden" name="csrf_token" value="{csrf_token}">
       <input type="file" name="files" accept=".zip" multiple required>
       <button type="submit" class="btn btn-primary">Upload</button>
     </form>
@@ -388,6 +439,7 @@ LOGIN_TEMPLATE = """
     <p class="subtitle">Authentication is required for UI access and uploads.</p>
     {error_html}
     <form method="POST" action="{subpath}/login">
+      <input type="hidden" name="csrf_token" value="{csrf_token}">
       <input type="hidden" name="next" value="{next_path}">
       <div class="field">
         <label for="username">Username</label>
@@ -406,7 +458,12 @@ LOGIN_TEMPLATE = """
 """
 
 
-def _render_html(request: Request, flash_msg: str = "", flash_type: str = "success") -> str:
+def _render_html(
+    request: Request,
+    csrf_token: str,
+    flash_msg: str = "",
+    flash_type: str = "success",
+) -> str:
     """Render the single-page HTML UI."""
     base = _base_url(request)
     versions = get_versions()
@@ -416,6 +473,14 @@ def _render_html(request: Request, flash_msg: str = "", flash_type: str = "succe
     if flash_msg:
         cls = "flash-success" if flash_type == "success" else "flash-error"
         flash_html = f'<div class="flash {cls}">{flash_msg}</div>'
+    logout_html = ""
+    if UI_AUTH_ENABLED:
+        logout_html = (
+            f'<form method="POST" action="{SUBPATH}/logout" style="margin-bottom: 1rem;">'
+            f'<input type="hidden" name="csrf_token" value="{csrf_token}">'
+            '<button type="submit" class="btn btn-outline">Logout</button>'
+            "</form>"
+        )
 
     # Versions table
     if versions:
@@ -450,6 +515,7 @@ def _render_html(request: Request, flash_msg: str = "", flash_type: str = "succe
                 f"<td>"
                 f'<form method="POST" action="{SUBPATH}/delete/{v}/{a["key"]}" style="display:inline"'
                 f' onsubmit="return confirm(\'Delete {a["key"]}?\')">'
+                f'<input type="hidden" name="csrf_token" value="{csrf_token}">'
                 f'<button type="submit" class="btn btn-danger">Delete</button></form>'
                 f"</td></tr>"
             )
@@ -462,8 +528,10 @@ def _render_html(request: Request, flash_msg: str = "", flash_type: str = "succe
     subpath_info = f"&middot; Subpath: <code>{SUBPATH}</code>" if SUBPATH else ""
 
     return HTML_TEMPLATE.format(
+        logout_html=logout_html,
         flash_html=flash_html,
         subpath=SUBPATH,
+        csrf_token=csrf_token,
         versions_html=versions_html,
         details_html=details_html,
         platform_info=platform.platform(),
@@ -472,11 +540,12 @@ def _render_html(request: Request, flash_msg: str = "", flash_type: str = "succe
     )
 
 
-def _render_login_html(next_path: str = "", error_msg: str = "") -> str:
+def _render_login_html(csrf_token: str, next_path: str = "", error_msg: str = "") -> str:
     safe_next = _safe_next_path(next_path)
     error_html = f'<div class="error">{error_msg}</div>' if error_msg else ""
     return LOGIN_TEMPLATE.format(
         subpath=SUBPATH,
+        csrf_token=csrf_token,
         next_path=safe_next,
         error_html=error_html,
     )
@@ -491,14 +560,23 @@ async def index(request: Request, msg: str = "", mtype: str = "success"):
     redirect = _require_ui_login(request)
     if redirect:
         return redirect
-    return HTMLResponse(_render_html(request, flash_msg=msg, flash_type=mtype))
+    csrf_token = _get_or_create_csrf_token(request)
+    response = HTMLResponse(_render_html(request, csrf_token=csrf_token, flash_msg=msg, flash_type=mtype))
+    _set_csrf_cookie(request, response, csrf_token)
+    return response
 
 
 @router.post("/upload")
-async def upload(request: Request, files: list[UploadFile] = File(...)):
+async def upload(
+    request: Request,
+    csrf_token: str = Form(""),
+    files: list[UploadFile] = File(...),
+):
     redirect = _require_ui_login(request)
     if redirect:
         return redirect
+    if not _is_csrf_valid(request, csrf_token):
+        return Response(content="CSRF validation failed", status_code=403)
     uploaded = []
     errors = []
 
@@ -535,10 +613,17 @@ async def upload(request: Request, files: list[UploadFile] = File(...)):
 
 
 @router.post("/delete/{version}/{filename}")
-async def delete(request: Request, version: str, filename: str):
+async def delete(
+    request: Request,
+    version: str,
+    filename: str,
+    csrf_token: str = Form(""),
+):
     redirect = _require_ui_login(request)
     if redirect:
         return redirect
+    if not _is_csrf_valid(request, csrf_token):
+        return Response(content="CSRF validation failed", status_code=403)
     safe_name = _secure_filename(filename)
     target = DATA_DIR / version / safe_name
     if target.exists():
@@ -559,7 +644,10 @@ async def login_page(request: Request, next: str = ""):
     if _is_valid_session_cookie(request.cookies.get(UI_COOKIE_NAME)):
         destination = _safe_next_path(next)
         return RedirectResponse(url=destination, status_code=303)
-    return HTMLResponse(_render_login_html(next_path=next))
+    csrf_token = _get_or_create_csrf_token(request)
+    response = HTMLResponse(_render_login_html(csrf_token=csrf_token, next_path=next))
+    _set_csrf_cookie(request, response, csrf_token)
+    return response
 
 
 @router.post("/login")
@@ -568,14 +656,20 @@ async def login_submit(
     username: str = Form(""),
     password: str = Form(""),
     next: str = Form(""),
+    csrf_token: str = Form(""),
 ):
     if not UI_AUTH_ENABLED:
         return RedirectResponse(url=f"{SUBPATH}/", status_code=303)
+    if not _is_csrf_valid(request, csrf_token):
+        return Response(content="CSRF validation failed", status_code=403)
     if not secrets.compare_digest(username, UI_USERNAME) or not secrets.compare_digest(password, UI_PASSWORD):
-        return HTMLResponse(
-            _render_login_html(next_path=next, error_msg="Invalid username or password."),
+        next_csrf = _get_or_create_csrf_token(request)
+        response = HTMLResponse(
+            _render_login_html(csrf_token=next_csrf, next_path=next, error_msg="Invalid username or password."),
             status_code=401,
         )
+        _set_csrf_cookie(request, response, next_csrf)
+        return response
 
     destination = _safe_next_path(next)
     response = RedirectResponse(url=destination, status_code=303)
@@ -591,7 +685,12 @@ async def login_submit(
 
 
 @router.post("/logout")
-async def logout():
+async def logout(
+    request: Request,
+    csrf_token: str = Form(""),
+):
+    if not _is_csrf_valid(request, csrf_token):
+        return Response(content="CSRF validation failed", status_code=403)
     response = RedirectResponse(url=f"{SUBPATH}/login", status_code=303)
     response.delete_cookie(key=UI_COOKIE_NAME, path=(SUBPATH or "/"))
     return response
