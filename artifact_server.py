@@ -35,11 +35,16 @@ Subpath example:
 import os
 import re
 import platform
+import hmac
+import hashlib
+import secrets
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import uvicorn
-from fastapi import APIRouter, FastAPI, File, Request, UploadFile
+from fastapi import APIRouter, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 # ---------------------------------------------------------------------------
@@ -50,6 +55,11 @@ HOST = os.environ.get("ARTIFACT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("ARTIFACT_PORT", "8080"))
 MAX_CONTENT_MB = int(os.environ.get("ARTIFACT_MAX_UPLOAD_MB", "500"))
 WORKERS = int(os.environ.get("ARTIFACT_WORKERS", "1"))
+UI_USERNAME = os.environ.get("UI_USERNAME", "").strip()
+UI_PASSWORD = os.environ.get("UI_PASSWORD", "").strip()
+UI_AUTH_ENABLED = bool(UI_USERNAME and UI_PASSWORD)
+UI_COOKIE_NAME = "ui_session"
+UI_SESSION_SECRET = os.environ.get("UI_SESSION_SECRET", f"{UI_USERNAME}:{UI_PASSWORD}")
 
 # Subpath support — strip/add leading/trailing slashes for consistency
 _raw_subpath = os.environ.get("ARTIFACT_SUBPATH", "").strip("/")
@@ -157,6 +167,56 @@ def _base_url(request: Request) -> str:
     return f"{scheme}://{host}{SUBPATH}"
 
 
+def _make_session_cookie_value(username: str) -> str:
+    payload = urlsafe_b64encode(username.encode("utf-8")).decode("ascii")
+    sig = hmac.new(
+        UI_SESSION_SECRET.encode("utf-8"),
+        payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def _is_valid_session_cookie(cookie_value: str | None) -> bool:
+    if not UI_AUTH_ENABLED:
+        return True
+    if not cookie_value or "." not in cookie_value:
+        return False
+
+    payload, sig = cookie_value.rsplit(".", 1)
+    expected = hmac.new(
+        UI_SESSION_SECRET.encode("utf-8"),
+        payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return False
+    try:
+        username = urlsafe_b64decode(payload.encode("ascii")).decode("utf-8")
+    except Exception:
+        return False
+    return username == UI_USERNAME
+
+
+def _require_ui_login(request: Request):
+    if not UI_AUTH_ENABLED:
+        return None
+    if _is_valid_session_cookie(request.cookies.get(UI_COOKIE_NAME)):
+        return None
+
+    next_path = request.url.path
+    if request.url.query:
+        next_path += f"?{request.url.query}"
+    safe_next = _safe_next_path(next_path)
+    return RedirectResponse(url=f"{SUBPATH}/login?next={quote(safe_next, safe='')}", status_code=303)
+
+
+def _safe_next_path(next_path: str) -> str:
+    if next_path.startswith("/") and not next_path.startswith("//"):
+        return next_path
+    return f"{SUBPATH}/"
+
+
 # ---------------------------------------------------------------------------
 # HTML Template (single-page UI)
 # ---------------------------------------------------------------------------
@@ -166,6 +226,7 @@ HTML_TEMPLATE = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>Elastic KB Artifact Server</title>
 <style>
   :root {{ --bg: #f5f7fa; --card: #fff; --accent: #0077cc; --border: #dde1e6; --text: #1a1a2e; --muted: #6b7280; }}
@@ -295,6 +356,54 @@ HTML_TEMPLATE = """
 </html>
 """
 
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Login - Elastic KB Artifact Server</title>
+<style>
+  :root { --bg: #f5f7fa; --card: #fff; --accent: #0077cc; --border: #dde1e6; --text: #1a1a2e; --muted: #6b7280; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.6; padding: 2rem; }
+  .wrap { min-height: calc(100vh - 4rem); display: flex; align-items: center; justify-content: center; }
+  .card { width: 100%; max-width: 420px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; }
+  h1 { font-size: 1.4rem; margin-bottom: .5rem; }
+  .subtitle { color: var(--muted); margin-bottom: 1rem; }
+  .field { margin-bottom: .9rem; }
+  label { display: block; font-size: .9rem; margin-bottom: .2rem; }
+  input { width: 100%; padding: .55rem .65rem; border: 1px solid var(--border); border-radius: 6px; font-size: .95rem; }
+  .btn { width: 100%; padding: .55rem .65rem; border: none; border-radius: 6px; cursor: pointer; font-size: .95rem; font-weight: 500; background: var(--accent); color: #fff; }
+  .btn:hover { background: #005fa3; }
+  .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; border-radius: 6px; padding: .55rem .65rem; margin-bottom: .9rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>UI Login</h1>
+    <p class="subtitle">Authentication is required for UI access and uploads.</p>
+    {error_html}
+    <form method="POST" action="{subpath}/login">
+      <input type="hidden" name="next" value="{next_path}">
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="btn">Sign In</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
 
 def _render_html(request: Request, flash_msg: str = "", flash_type: str = "success") -> str:
     """Render the single-page HTML UI."""
@@ -362,17 +471,33 @@ def _render_html(request: Request, flash_msg: str = "", flash_type: str = "succe
     )
 
 
+def _render_login_html(next_path: str = "", error_msg: str = "") -> str:
+    safe_next = _safe_next_path(next_path)
+    error_html = f'<div class="error">{error_msg}</div>' if error_msg else ""
+    return LOGIN_TEMPLATE.format(
+        subpath=SUBPATH,
+        next_path=safe_next,
+        error_html=error_html,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request, msg: str = "", mtype: str = "success"):
+    redirect = _require_ui_login(request)
+    if redirect:
+        return redirect
     return HTMLResponse(_render_html(request, flash_msg=msg, flash_type=mtype))
 
 
 @router.post("/upload")
 async def upload(request: Request, files: list[UploadFile] = File(...)):
+    redirect = _require_ui_login(request)
+    if redirect:
+        return redirect
     uploaded = []
     errors = []
 
@@ -409,7 +534,10 @@ async def upload(request: Request, files: list[UploadFile] = File(...)):
 
 
 @router.post("/delete/{version}/{filename}")
-async def delete(version: str, filename: str):
+async def delete(request: Request, version: str, filename: str):
+    redirect = _require_ui_login(request)
+    if redirect:
+        return redirect
     safe_name = _secure_filename(filename)
     target = DATA_DIR / version / safe_name
     if target.exists():
@@ -421,6 +549,50 @@ async def delete(version: str, filename: str):
         msg = f"Deleted {safe_name} from v{version}."
         return RedirectResponse(url=f"{SUBPATH}/?msg={msg}&mtype=success", status_code=303)
     return RedirectResponse(url=f"{SUBPATH}/?msg=File not found: {safe_name}&mtype=error", status_code=303)
+
+
+@router.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, next: str = ""):
+    if not UI_AUTH_ENABLED:
+        return RedirectResponse(url=f"{SUBPATH}/", status_code=303)
+    if _is_valid_session_cookie(request.cookies.get(UI_COOKIE_NAME)):
+        destination = _safe_next_path(next)
+        return RedirectResponse(url=destination, status_code=303)
+    return HTMLResponse(_render_login_html(next_path=next))
+
+
+@router.post("/login")
+async def login_submit(
+    username: str = Form(""),
+    password: str = Form(""),
+    next: str = Form(""),
+):
+    if not UI_AUTH_ENABLED:
+        return RedirectResponse(url=f"{SUBPATH}/", status_code=303)
+    if not secrets.compare_digest(username, UI_USERNAME) or not secrets.compare_digest(password, UI_PASSWORD):
+        return HTMLResponse(
+            _render_login_html(next_path=next, error_msg="Invalid username or password."),
+            status_code=401,
+        )
+
+    destination = _safe_next_path(next)
+    response = RedirectResponse(url=destination, status_code=303)
+    response.set_cookie(
+        key=UI_COOKIE_NAME,
+        value=_make_session_cookie_value(username),
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path=(SUBPATH or "/"),
+    )
+    return response
+
+
+@router.post("/logout")
+async def logout():
+    response = RedirectResponse(url=f"{SUBPATH}/login", status_code=303)
+    response.delete_cookie(key=UI_COOKIE_NAME, path=(SUBPATH or "/"))
+    return response
 
 
 @router.get("/artifacts/{version}")
@@ -458,8 +630,9 @@ if __name__ == "__main__":
     print(f"Data directory: {DATA_DIR.resolve()}")
     print(f"Subpath       : {SUBPATH or '(none)'}")
     print(f"Workers       : {WORKERS}")
+    print(f"UI login      : {'enabled' if UI_AUTH_ENABLED else 'disabled'}")
     print(f"Listening on  : http://{HOST}:{PORT}{SUBPATH}/")
-    print(f"Upload UI     : http://localhost:{PORT}{SUBPATH}/")
+    print(f"Upload UI     : http://{HOST}:{PORT}{SUBPATH}/")
     print()
 
     # Run using the import string "artifact_server:app" to enable multiple workers
